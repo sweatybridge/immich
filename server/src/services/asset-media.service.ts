@@ -34,6 +34,7 @@ import { UploadFile, UploadRequest } from 'src/types';
 import { requireUploadAccess } from 'src/utils/access';
 import { asUploadRequest, onBeforeLink } from 'src/utils/asset.util';
 import { isAssetChecksumConstraint } from 'src/utils/database';
+import { getDbMediaId } from 'src/utils/db-media';
 import { getFilenameExtension, getFileNameWithoutExtension, ImmichFileResponse } from 'src/utils/file';
 import { mimeTypes } from 'src/utils/mime-types';
 import { fromChecksum } from 'src/utils/request';
@@ -236,9 +237,11 @@ export class AssetMediaService extends BaseService {
 
     const path = editedPath ?? originalPath!;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       path,
-      fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
+      fileName:
+        getFileNameWithoutExtension(originalFileName) +
+        (getFilenameExtension(path) || getFilenameExtension(originalFileName)),
       contentType: mimeTypes.lookup(path),
       cacheControl: CacheControl.PrivateWithCache,
     });
@@ -285,7 +288,7 @@ export class AssetMediaService extends BaseService {
       auth.sharedLink && !auth.sharedLink.showExif ? id : getFileNameWithoutExtension(originalFileName);
     const fileName = `${fileNameBase}_${size}${getFilenameExtension(path)}`;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       fileName,
       path,
       contentType: mimeTypes.lookup(path),
@@ -304,7 +307,7 @@ export class AssetMediaService extends BaseService {
 
     const filepath = asset.encodedVideoPath || asset.originalPath;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       path: filepath,
       contentType: mimeTypes.lookup(filepath),
       cacheControl: CacheControl.PrivateWithCache,
@@ -351,5 +354,25 @@ export class AssetMediaService extends BaseService {
     if (auth.user.quotaSizeInBytes !== null && auth.user.quotaSizeInBytes < auth.user.quotaUsageInBytes + size) {
       throw new BadRequestException('Quota has been exceeded!');
     }
+  }
+
+  private async getFileResponse(response: {
+    path: string;
+    contentType: string;
+    cacheControl: CacheControl;
+    fileName?: string;
+  }): Promise<ImmichFileResponse> {
+    const objectId = getDbMediaId(response.path);
+    if (!objectId) {
+      return new ImmichFileResponse(response);
+    }
+
+    const stream = await this.databaseRepository.createMediaReadStream(objectId);
+    return new ImmichFileResponse({
+      stream,
+      fileName: response.fileName,
+      contentType: stream.type || response.contentType,
+      cacheControl: response.cacheControl,
+    });
   }
 }

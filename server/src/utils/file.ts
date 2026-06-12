@@ -2,6 +2,7 @@ import { HttpException, NotFoundException, StreamableFile } from '@nestjs/common
 import { NextFunction, Response } from 'express';
 import { access, constants } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { CacheControl } from 'src/enum';
 import { LoggingRepository } from 'src/repositories/logging.repository';
@@ -21,7 +22,8 @@ export function getLivePhotoMotionFilename(stillName: string, motionName: string
 }
 
 export class ImmichFileResponse {
-  public readonly path!: string;
+  public readonly path?: string;
+  public readonly stream?: ImmichReadStream;
   public readonly contentType!: string;
   public readonly cacheControl!: CacheControl;
   public readonly fileName?: string;
@@ -53,8 +55,6 @@ export const sendFile = async (
   try {
     const file = await handler();
 
-    await access(file.path, constants.R_OK);
-
     const cacheControlHeader = cacheControlHeaders[file.cacheControl];
     if (cacheControlHeader) {
       // set the header to Cache-Control
@@ -66,6 +66,18 @@ export const sendFile = async (
       res.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.fileName)}`);
     }
 
+    if (file.stream) {
+      if (file.stream.length !== undefined) {
+        res.header('Content-Length', file.stream.length.toString());
+      }
+      return await pipeline(file.stream.stream, res);
+    }
+
+    if (!file.path) {
+      throw new Error('No file path or stream was provided');
+    }
+
+    await access(file.path, constants.R_OK);
     return await _sendFile(file.path, { dotfiles: 'allow' });
   } catch (error: Error | any) {
     // ignore client-closed connection

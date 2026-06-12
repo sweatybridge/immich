@@ -14,6 +14,7 @@ import {
 } from 'src/enum';
 import { BaseService } from 'src/services/base.service';
 import { JobOf, SystemFlags } from 'src/types';
+import { getDbMediaId } from 'src/utils/db-media';
 import { ImmichStartupError } from 'src/utils/misc';
 
 const docsMessage = `Please see https://docs.immich.app/administration/system-integrity#folder-checks for more information.`;
@@ -143,6 +144,12 @@ export class StorageService extends BaseService {
       }
 
       try {
+        const mediaObjectId = getDbMediaId(file);
+        if (mediaObjectId) {
+          await this.databaseRepository.deleteMediaObject(mediaObjectId);
+          continue;
+        }
+
         await this.storageRepository.unlink(file);
       } catch (error: any) {
         this.logger.warn('Unable to remove file from disk', error);
