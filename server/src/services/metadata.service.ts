@@ -34,6 +34,7 @@ import { JobItem, JobOf } from 'src/types';
 import { getAssetFiles } from 'src/utils/asset.util';
 import { isAssetChecksumConstraint } from 'src/utils/database';
 import { mergeTimeZone } from 'src/utils/date';
+import { getDbMediaId } from 'src/utils/db-media';
 import { mimeTypes } from 'src/utils/mime-types';
 import { isFaceImportEnabled } from 'src/utils/misc';
 import { upsertTags } from 'src/utils/tag';
@@ -243,10 +244,7 @@ export class MetadataService extends BaseService {
       return;
     }
 
-    const [exifResult, stats] = await Promise.all([
-      this.getExifTags(asset),
-      this.storageRepository.stat(asset.originalPath),
-    ]);
+    const [exifResult, stats] = await Promise.all([this.getExifTags(asset), this.getOriginalStats(asset)]);
     const { tags: exifTags, audio, video, packets, format } = exifResult;
     this.logger.verbose('Exif Tags', exifTags);
 
@@ -579,12 +577,13 @@ export class MetadataService extends BaseService {
 
   private async getExifTags(asset: { originalPath: string; files: AssetFile[]; type: AssetType }) {
     const { sidecarFile } = getAssetFiles(asset.files);
+    const isDatabaseOriginal = !!getDbMediaId(asset.originalPath);
     const shouldProbe = asset.type === AssetType.Video || asset.originalPath.toLowerCase().endsWith('.gif');
 
     const [mediaTags, sidecarTags, videoResult] = await Promise.all([
-      this.metadataRepository.readTags(asset.originalPath),
+      isDatabaseOriginal ? ({} as ImmichTags) : this.metadataRepository.readTags(asset.originalPath),
       sidecarFile ? this.metadataRepository.readTags(sidecarFile.path) : null,
-      shouldProbe ? this.getVideoTags(asset.originalPath) : null,
+      shouldProbe && !isDatabaseOriginal ? this.getVideoTags(asset.originalPath) : null,
     ]);
 
     // prefer dates from sidecar tags
@@ -971,6 +970,26 @@ export class MetadataService extends BaseService {
     if (missingWithFaceAsset.length > 0) {
       await this.personRepository.updateAll(missingWithFaceAsset);
     }
+  }
+
+  private async getOriginalStats(asset: { originalPath: string; fileCreatedAt: Date; fileModifiedAt: Date }) {
+    const objectId = getDbMediaId(asset.originalPath);
+    if (!objectId) {
+      return this.storageRepository.stat(asset.originalPath);
+    }
+
+    const object = await this.databaseRepository.getMediaObject(objectId);
+    if (!object) {
+      throw new Error(`Media object not found: ${objectId}`);
+    }
+
+    return {
+      size: object.sizeBytes,
+      mtime: asset.fileModifiedAt,
+      mtimeMs: asset.fileModifiedAt.getTime(),
+      birthtime: asset.fileCreatedAt,
+      birthtimeMs: asset.fileCreatedAt.getTime(),
+    } as Stats;
   }
 
   private getDates(

@@ -6,7 +6,7 @@ import { InjectKysely } from 'nestjs-kysely';
 import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import semver from 'semver';
 import {
   EXTENSION_NAMES,
@@ -71,6 +71,18 @@ export interface CreateMediaObjectOptions {
   kind: string;
   mimeType?: string | null;
   data: Buffer;
+  checksum?: Buffer | null;
+}
+
+export interface CreateMediaUploadOptions {
+  ownerId: string;
+  assetId?: string | null;
+  kind: string;
+  mimeType?: string | null;
+}
+
+export interface FinalizeMediaObjectOptions {
+  sizeBytes: number;
   checksum?: Buffer | null;
 }
 
@@ -197,6 +209,47 @@ export class DatabaseRepository {
     });
 
     return asDbMediaPath(id);
+  }
+
+  async createMediaUpload({
+    ownerId,
+    assetId = null,
+    kind,
+    mimeType = null,
+  }: CreateMediaUploadOptions): Promise<{ id: string; path: string; stream: Writable }> {
+    const id = randomUUID();
+    let chunkIndex = 0;
+
+    await this.db
+      .insertInto('media_object')
+      .values({ id, ownerId, assetId, kind, mimeType, sizeBytes: 0, checksum: null })
+      .execute();
+
+    const stream = new Writable({
+      write: (chunk: Buffer, _encoding, callback) => {
+        const data = Buffer.from(chunk);
+        this.db
+          .insertInto('media_object_chunk')
+          .values({ objectId: id, chunkIndex: chunkIndex++, data })
+          .execute()
+          .then(() => callback())
+          .catch(callback);
+      },
+    });
+
+    return { id, path: asDbMediaPath(id), stream };
+  }
+
+  async finalizeMediaObject(id: string, { sizeBytes, checksum = null }: FinalizeMediaObjectOptions): Promise<void> {
+    await this.db
+      .updateTable('media_object')
+      .set({ sizeBytes, checksum, updatedAt: new Date() })
+      .where('id', '=', id)
+      .execute();
+  }
+
+  async setMediaObjectAssetId(id: string, assetId: string): Promise<void> {
+    await this.db.updateTable('media_object').set({ assetId, updatedAt: new Date() }).where('id', '=', id).execute();
   }
 
   async readMediaObject(id: string): Promise<Buffer> {

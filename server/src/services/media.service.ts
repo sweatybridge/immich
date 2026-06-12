@@ -274,16 +274,24 @@ export class MediaService extends BaseService {
     return { info, data, colorspace };
   }
 
+  private async getMediaInput(path: string): Promise<string | Buffer> {
+    const objectId = getDbMediaId(path);
+    return objectId ? this.databaseRepository.readMediaObject(objectId) : path;
+  }
+
   private async extractOriginalImage(asset: ThumbnailAsset, image: SystemConfig['image'], useEdits = false) {
+    const originalInput = await this.getMediaInput(asset.originalPath);
+    const isDatabaseOriginal = Buffer.isBuffer(originalInput);
     const extractEmbedded = image.extractEmbedded && mimeTypes.isRaw(asset.originalFileName);
-    const extracted = extractEmbedded ? await this.extractImage(asset.originalPath, image.preview.size) : null;
+    const extracted =
+      extractEmbedded && !isDatabaseOriginal ? await this.extractImage(asset.originalPath, image.preview.size) : null;
     const generateFullsize =
       ((image.fullsize.enabled || asset.exifInfo.projectionType === 'EQUIRECTANGULAR') &&
-        !mimeTypes.isWebSupportedImage(asset.originalPath)) ||
+        !mimeTypes.isWebSupportedImage(asset.originalFileName)) ||
       useEdits;
     const convertFullsize = generateFullsize && (!extracted || !mimeTypes.isWebSupportedImage(` .${extracted.format}`));
 
-    const thumbSource = extracted ? extracted.buffer : asset.originalPath;
+    const thumbSource = extracted ? extracted.buffer : originalInput;
     const { data, info, colorspace } = await this.decodeImage(
       thumbSource,
       // only specify orientation to extracted images which don't have EXIF orientation data
@@ -293,8 +301,8 @@ export class MediaService extends BaseService {
     );
 
     let isTransparent = false;
-    if (!extracted && mimeTypes.canBeTransparent(asset.originalPath)) {
-      ({ isTransparent } = await this.mediaRepository.getImageMetadata(asset.originalPath));
+    if (!extracted && mimeTypes.canBeTransparent(asset.originalFileName)) {
+      ({ isTransparent } = await this.mediaRepository.getImageMetadata(originalInput));
     }
 
     return {
@@ -387,7 +395,7 @@ export class MediaService extends BaseService {
 
     const outputs = await Promise.all(promises);
 
-    if (asset.exifInfo.projectionType === 'EQUIRECTANGULAR') {
+    if (asset.exifInfo.projectionType === 'EQUIRECTANGULAR' && !getDbMediaId(asset.originalPath)) {
       const promises = [
         this.mediaRepository.copyTagGroup('XMP-GPano', asset.originalPath, previewFile.path),
         fullsizeFile
@@ -427,12 +435,12 @@ export class MediaService extends BaseService {
         this.logger.error(`Could not generate person thumbnail for video ${id}: missing preview path`);
         return JobStatus.Failed;
       }
-      inputImage = previewPath;
-    } else if (image.extractEmbedded && mimeTypes.isRaw(originalPath)) {
+      inputImage = await this.getMediaInput(previewPath);
+    } else if (image.extractEmbedded && mimeTypes.isRaw(originalPath) && !getDbMediaId(originalPath)) {
       const extracted = await this.extractImage(originalPath, image.preview.size);
       inputImage = extracted ? extracted.buffer : originalPath;
     } else {
-      inputImage = originalPath;
+      inputImage = await this.getMediaInput(originalPath);
     }
 
     const { data: decodedImage, info } = await this.mediaRepository.decodeImage(inputImage, {
