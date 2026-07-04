@@ -35,11 +35,13 @@ import {
   ImageDimensions,
   JobItem,
   JobOf,
+  TranscodeCommand,
   VideoFormat,
   VideoInterfaces,
   VideoStreamInfo,
 } from 'src/types';
 import { getAssetFile, getDimensions } from 'src/utils/asset.util';
+import { getDbMediaId } from 'src/utils/db-media';
 import { checkFaceVisibility, checkOcrVisibility } from 'src/utils/editor';
 import { BaseConfig, ThumbnailConfig } from 'src/utils/media';
 import { mimeTypes } from 'src/utils/mime-types';
@@ -56,6 +58,7 @@ interface UpsertFileOptions {
 }
 
 type ThumbnailAsset = NonNullable<Awaited<ReturnType<AssetJobRepository['getForGenerateThumbnailJob']>>>;
+type VideoConversionAsset = NonNullable<Awaited<ReturnType<AssetJobRepository['getForVideoConversion']>>>;
 
 @Injectable()
 export class MediaService extends BaseService {
@@ -271,16 +274,24 @@ export class MediaService extends BaseService {
     return { info, data, colorspace };
   }
 
+  private async getMediaInput(path: string): Promise<string | Buffer> {
+    const objectId = getDbMediaId(path);
+    return objectId ? this.databaseRepository.readMediaObject(objectId) : path;
+  }
+
   private async extractOriginalImage(asset: ThumbnailAsset, image: SystemConfig['image'], useEdits = false) {
+    const originalInput = await this.getMediaInput(asset.originalPath);
+    const isDatabaseOriginal = Buffer.isBuffer(originalInput);
     const extractEmbedded = image.extractEmbedded && mimeTypes.isRaw(asset.originalFileName);
-    const extracted = extractEmbedded ? await this.extractImage(asset.originalPath, image.preview.size) : null;
+    const extracted =
+      extractEmbedded && !isDatabaseOriginal ? await this.extractImage(asset.originalPath, image.preview.size) : null;
     const generateFullsize =
       ((image.fullsize.enabled || asset.exifInfo.projectionType === 'EQUIRECTANGULAR') &&
-        !mimeTypes.isWebSupportedImage(asset.originalPath)) ||
+        !mimeTypes.isWebSupportedImage(asset.originalFileName)) ||
       useEdits;
     const convertFullsize = generateFullsize && (!extracted || !mimeTypes.isWebSupportedImage(` .${extracted.format}`));
 
-    const thumbSource = extracted ? extracted.buffer : asset.originalPath;
+    const thumbSource = extracted ? extracted.buffer : originalInput;
     const { data, info, colorspace } = await this.decodeImage(
       thumbSource,
       // only specify orientation to extracted images which don't have EXIF orientation data
@@ -290,8 +301,8 @@ export class MediaService extends BaseService {
     );
 
     let isTransparent = false;
-    if (!extracted && mimeTypes.canBeTransparent(asset.originalPath)) {
-      ({ isTransparent } = await this.mediaRepository.getImageMetadata(asset.originalPath));
+    if (!extracted && mimeTypes.canBeTransparent(asset.originalFileName)) {
+      ({ isTransparent } = await this.mediaRepository.getImageMetadata(originalInput));
     }
 
     return {
@@ -384,7 +395,7 @@ export class MediaService extends BaseService {
 
     const outputs = await Promise.all(promises);
 
-    if (asset.exifInfo.projectionType === 'EQUIRECTANGULAR') {
+    if (asset.exifInfo.projectionType === 'EQUIRECTANGULAR' && !getDbMediaId(asset.originalPath)) {
       const promises = [
         this.mediaRepository.copyTagGroup('XMP-GPano', asset.originalPath, previewFile.path),
         fullsizeFile
@@ -424,12 +435,12 @@ export class MediaService extends BaseService {
         this.logger.error(`Could not generate person thumbnail for video ${id}: missing preview path`);
         return JobStatus.Failed;
       }
-      inputImage = previewPath;
-    } else if (image.extractEmbedded && mimeTypes.isRaw(originalPath)) {
+      inputImage = await this.getMediaInput(previewPath);
+    } else if (image.extractEmbedded && mimeTypes.isRaw(originalPath) && !getDbMediaId(originalPath)) {
       const extracted = await this.extractImage(originalPath, image.preview.size);
       inputImage = extracted ? extracted.buffer : originalPath;
     } else {
-      inputImage = originalPath;
+      inputImage = await this.getMediaInput(originalPath);
     }
 
     const { data: decodedImage, info } = await this.mediaRepository.decodeImage(inputImage, {
@@ -520,12 +531,54 @@ export class MediaService extends BaseService {
       isProgressive: false,
       isTransparent: false,
     });
-    this.storageCore.ensureFolders(previewFile.path);
 
     const { videoStream, format } = asset;
     if (!videoStream || !format) {
       throw new Error(`Missing video metadata for asset ${asset.id}`);
     }
+
+    const dbMediaId = getDbMediaId(asset.originalPath);
+    if (dbMediaId) {
+      const previewFormat = this.getPgThumbnailFormat(image.preview.format);
+      const thumbnailFormat = this.getPgThumbnailFormat(image.thumbnail.format);
+      const previewPath = await this.databaseRepository.thumbnailMediaObject({
+        inputObjectId: dbMediaId,
+        ownerId: asset.ownerId,
+        assetId: asset.id,
+        outputKind: AssetFileType.Preview,
+        mimeType: this.getImageMimeType(previewFormat),
+        format: previewFormat,
+      });
+      const thumbnailPath = await this.databaseRepository.thumbnailMediaObject({
+        inputObjectId: dbMediaId,
+        ownerId: asset.ownerId,
+        assetId: asset.id,
+        outputKind: AssetFileType.Thumbnail,
+        mimeType: this.getImageMimeType(thumbnailFormat),
+        format: thumbnailFormat,
+      });
+      const previewObjectId = getDbMediaId(previewPath);
+      if (!previewObjectId) {
+        throw new Error(`Invalid DB media locator for generated preview: ${previewPath}`);
+      }
+
+      const previewBuffer = await this.databaseRepository.readMediaObject(previewObjectId);
+      const thumbhash = await this.mediaRepository.generateThumbhash(previewBuffer, {
+        colorspace: image.colorspace,
+        processInvalidImages: process.env.IMMICH_PROCESS_INVALID_IMAGES === 'true',
+      });
+
+      return {
+        files: [
+          { ...previewFile, path: previewPath, isProgressive: false, isTransparent: false },
+          { ...thumbnailFile, path: thumbnailPath, isProgressive: false, isTransparent: false },
+        ],
+        thumbhash,
+        fullsizeDimensions: { width: videoStream.width, height: videoStream.height },
+      };
+    }
+
+    this.storageCore.ensureFolders(previewFile.path);
 
     const previewConfig = ThumbnailConfig.create({ ...ffmpeg, targetResolution: image.preview.size.toString() });
     const thumbConfig = ThumbnailConfig.create({ ...ffmpeg, targetResolution: image.thumbnail.size.toString() });
@@ -574,8 +627,11 @@ export class MediaService extends BaseService {
     }
 
     const input = asset.originalPath;
-    const output = StorageCore.getEncodedVideoPath(asset);
-    this.storageCore.ensureFolders(output);
+    const inputObjectId = getDbMediaId(input);
+    const output = inputObjectId ? null : StorageCore.getEncodedVideoPath(asset);
+    if (output) {
+      this.storageCore.ensureFolders(output);
+    }
 
     const { videoStream, format } = asset;
     const audioStream = asset.audioStream ?? undefined;
@@ -612,8 +668,15 @@ export class MediaService extends BaseService {
       );
     }
 
+    let outputPath: string | null = null;
     try {
-      await this.mediaRepository.transcode(input, output, command);
+      outputPath = await this.transcodeVideo(
+        asset,
+        inputObjectId,
+        output,
+        command,
+        ffmpeg.accel !== TranscodeHardwareAcceleration.Disabled,
+      );
     } catch (error: any) {
       this.logger.error(`Error occurred during transcoding: ${error.message}`);
       if (ffmpeg.accel === TranscodeHardwareAcceleration.Disabled) {
@@ -626,7 +689,7 @@ export class MediaService extends BaseService {
           this.logger.error(`Retrying with ${ffmpeg.accel.toUpperCase()}-accelerated encoding and software decoding`);
           ffmpeg = { ...ffmpeg, accelDecode: false };
           const command = BaseConfig.create(ffmpeg, this.videoInterfaces).getCommand(target, videoStream, audioStream);
-          await this.mediaRepository.transcode(input, output, command);
+          outputPath = await this.transcodeVideo(asset, inputObjectId, output, command, true);
           partialFallbackSuccess = true;
         } catch (error: any) {
           this.logger.error(`Error occurred during transcoding: ${error.message}`);
@@ -637,20 +700,121 @@ export class MediaService extends BaseService {
         this.logger.error(`Retrying with ${ffmpeg.accel.toUpperCase()} acceleration disabled`);
         ffmpeg = { ...ffmpeg, accel: TranscodeHardwareAcceleration.Disabled };
         const command = BaseConfig.create(ffmpeg, this.videoInterfaces).getCommand(target, videoStream, audioStream);
-        await this.mediaRepository.transcode(input, output, command);
+        outputPath = await this.transcodeVideo(asset, inputObjectId, output, command, false);
       }
     }
 
     this.logger.log(`Successfully encoded ${asset.id}`);
+    if (!outputPath) {
+      throw new Error(`Missing encoded video output path for asset ${asset.id}`);
+    }
 
     await this.assetRepository.upsertFile({
       assetId: asset.id,
       type: AssetFileType.EncodedVideo,
-      path: output,
+      path: outputPath,
       isEdited: false,
     });
 
+    const previousEncodedVideo = getAssetFile(asset.files, AssetFileType.EncodedVideo, { isEdited: false });
+    if (previousEncodedVideo && previousEncodedVideo.path !== outputPath) {
+      await this.jobRepository.queue({ name: JobName.FileDelete, data: { files: [previousEncodedVideo.path] } });
+    }
+
     return JobStatus.Success;
+  }
+
+  private async transcodeVideo(
+    asset: VideoConversionAsset,
+    inputObjectId: string | null,
+    output: string | null,
+    command: TranscodeCommand,
+    hwaccel: boolean,
+  ): Promise<string> {
+    if (!inputObjectId) {
+      if (!output) {
+        throw new Error(`Missing filesystem output path for asset ${asset.id}`);
+      }
+      await this.mediaRepository.transcode(asset.originalPath, output, command);
+      return output;
+    }
+
+    if (command.twoPass) {
+      this.logger.warn(`pg_ffmpeg does not support Immich two-pass transcoding; using a single-pass transcode`);
+    }
+
+    const options = this.getPgFfmpegTranscodeOptions(command);
+    return this.databaseRepository.transcodeMediaObject({
+      inputObjectId,
+      ownerId: asset.ownerId,
+      assetId: asset.id,
+      outputKind: AssetFileType.EncodedVideo,
+      mimeType: 'video/mp4',
+      format: 'mp4',
+      ...options,
+      hwaccel,
+    });
+  }
+
+  private getPgFfmpegTranscodeOptions(command: TranscodeCommand) {
+    const args = command.outputOptions;
+    const codec = this.getFfmpegOption(args, '-c:v') ?? this.getFfmpegOption(args, '-codec:v');
+    const audioCodec = this.getFfmpegOption(args, '-c:a') ?? this.getFfmpegOption(args, '-codec:a');
+
+    return {
+      filter: this.getFfmpegOption(args, '-vf'),
+      codec: codec === 'copy' ? null : codec,
+      preset: this.getFfmpegOption(args, '-preset'),
+      crf: this.parseNullableInt(this.getFfmpegOption(args, '-crf')),
+      bitrate: this.parseBitrate(this.getFfmpegOption(args, '-b:v')),
+      audioCodec: audioCodec === 'copy' ? null : audioCodec,
+      audioFilter: this.getFfmpegOption(args, '-af'),
+      audioBitrate: this.parseBitrate(this.getFfmpegOption(args, '-b:a')),
+    };
+  }
+
+  private getFfmpegOption(args: string[], option: string): string | null {
+    const index = args.lastIndexOf(option);
+    if (index === -1) {
+      return null;
+    }
+
+    return args[index + 1] ?? null;
+  }
+
+  private parseNullableInt(value: string | null): number | null {
+    if (!value) {
+      return null;
+    }
+    const parsed = Number.parseInt(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  private parseBitrate(value: string | null): number | null {
+    if (!value) {
+      return null;
+    }
+
+    const parsed = Number.parseInt(value);
+    if (Number.isNaN(parsed)) {
+      return null;
+    }
+
+    if (value.toLowerCase().endsWith('k')) {
+      return parsed * 1000;
+    }
+    if (value.toLowerCase().endsWith('m')) {
+      return parsed * 1_000_000;
+    }
+    return parsed;
+  }
+
+  private getPgThumbnailFormat(format: ImageFormat): 'jpeg' | 'png' {
+    return format === ImageFormat.Jpeg ? 'jpeg' : 'png';
+  }
+
+  private getImageMimeType(format: 'jpeg' | 'png') {
+    return `image/${format}`;
   }
 
   private getTranscodeTarget(

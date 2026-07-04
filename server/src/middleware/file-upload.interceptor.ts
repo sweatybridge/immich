@@ -104,45 +104,52 @@ export class FileUploadInterceptor implements NestInterceptor {
       this.assetService.onUploadError(request, file).catch(this.logger.error);
     });
 
+    this.handleFileUpload(request, file).then((result) => callback(null, result)).catch(callback);
+  }
+
+  private async handleFileUpload(request: AuthRequest, file: Express.Multer.File): Promise<Partial<ImmichFile>> {
+    (file as ImmichMulterFile).uuid = randomUUID();
+
+    const uploadRequest = asUploadRequest(request, file);
+    const mediaUpload = await this.assetService.createUploadStream(uploadRequest);
+
+    const path =
+      mediaUpload?.path ??
+      join(this.assetService.getUploadFolder(uploadRequest), this.assetService.getUploadFilename(uploadRequest));
+
+    file.path = path;
+    const writeStream = mediaUpload?.stream ?? this.storageRepository.createWriteStream(path);
+    const hash = file.fieldname === UploadFieldName.ASSET_DATA ? createHash('sha1') : null;
+
+    let size = 0;
+
+    file.stream.on('data', (chunk) => {
+      hash?.update(chunk);
+      size += chunk.length;
+    });
+
     try {
-      (file as ImmichMulterFile).uuid = randomUUID();
-
-      const uploadRequest = asUploadRequest(request, file);
-
-      const path = join(
-        this.assetService.getUploadFolder(uploadRequest),
-        this.assetService.getUploadFilename(uploadRequest),
-      );
-
-      const writeStream = this.storageRepository.createWriteStream(path);
-      const hash = file.fieldname === UploadFieldName.ASSET_DATA ? createHash('sha1') : null;
-
-      let size = 0;
-
-      file.stream.on('data', (chunk) => {
-        hash?.update(chunk);
-        size += chunk.length;
-      });
-
-      pipeline(file.stream, writeStream, (error) => {
-        if (error) {
-          hash?.destroy();
-          return callback(error);
-        }
-        callback(null, {
-          path,
-          size,
-          checksum: hash?.digest(),
-        });
+      await new Promise<void>((resolve, reject) => {
+        pipeline(file.stream, writeStream, (error) => (error ? reject(error) : resolve()));
       });
     } catch (error: Error | any) {
-      callback(error);
+      hash?.destroy();
+      throw error;
     }
+
+    const checksum = hash?.digest();
+    await this.assetService.finalizeUpload(path, size, checksum);
+
+    return {
+      path,
+      size,
+      checksum,
+    };
   }
 
   private removeFile(_request: AuthRequest, file: Express.Multer.File, callback: (error: Error | null) => void) {
-    this.storageRepository
-      .unlink(file.path)
+    this.assetService
+      .removeUploadFile(file.path)
       .then(() => callback(null))
       .catch(callback);
   }

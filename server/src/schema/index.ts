@@ -51,6 +51,7 @@ import { FaceSearchTable } from 'src/schema/tables/face-search.table';
 import { GeodataPlacesTable } from 'src/schema/tables/geodata-places.table';
 import { IntegrityReportTable } from 'src/schema/tables/integrity-report.table';
 import { LibraryTable } from 'src/schema/tables/library.table';
+import { MediaObjectChunkTable, MediaObjectTable } from 'src/schema/tables/media-object.table';
 import { MemoryAssetAuditTable } from 'src/schema/tables/memory-asset-audit.table';
 import { MemoryAssetTable } from 'src/schema/tables/memory-asset.table';
 import { MemoryAuditTable } from 'src/schema/tables/memory-audit.table';
@@ -122,6 +123,8 @@ export class ImmichDatabase {
     MemoryAuditTable,
     MemoryAssetTable,
     MemoryAssetAuditTable,
+    MediaObjectTable,
+    MediaObjectChunkTable,
     MoveTable,
     NaturalEarthCountriesTable,
     NotificationTable,
@@ -229,6 +232,9 @@ export interface DB {
   memory_audit: MemoryAuditTable;
   memory_asset: MemoryAssetTable;
   memory_asset_audit: MemoryAssetAuditTable;
+
+  media_object: MediaObjectTable;
+  media_object_chunk: MediaObjectChunkTable;
 
   migrations: Migrations;
 

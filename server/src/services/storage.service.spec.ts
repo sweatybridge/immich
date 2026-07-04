@@ -199,5 +199,12 @@ describe(StorageService.name, () => {
 
       expect(mocks.storage.unlink).toHaveBeenCalledWith('path/to/something');
     });
+
+    it('should remove database media objects', async () => {
+      await sut.handleDeleteFiles({ files: ['db:7c75e90d-7ec9-45b4-8ed5-8a96c87087a8'] });
+
+      expect(mocks.database.deleteMediaObject).toHaveBeenCalledWith('7c75e90d-7ec9-45b4-8ed5-8a96c87087a8');
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
   });
 });

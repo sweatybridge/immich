@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { extname } from 'node:path';
+import type { Writable } from 'node:stream';
 import sanitize from 'sanitize-filename';
 import { StorageCore } from 'src/cores/storage.core';
 import { AuthSharedLink } from 'src/database';
@@ -34,6 +35,7 @@ import { UploadFile, UploadRequest } from 'src/types';
 import { requireUploadAccess } from 'src/utils/access';
 import { asUploadRequest, onBeforeLink } from 'src/utils/asset.util';
 import { isAssetChecksumConstraint } from 'src/utils/database';
+import { getDbMediaId } from 'src/utils/db-media';
 import { getFilenameExtension, getFileNameWithoutExtension, ImmichFileResponse } from 'src/utils/file';
 import { mimeTypes } from 'src/utils/mime-types';
 import { fromChecksum } from 'src/utils/request';
@@ -89,6 +91,43 @@ export class AssetMediaService extends BaseService {
     throw new BadRequestException(`Unsupported file type ${filename}`);
   }
 
+  async createUploadStream({
+    auth,
+    fieldName,
+    file,
+    body,
+  }: UploadRequest): Promise<{ id: string; path: string; stream: Writable } | null> {
+    auth = requireUploadAccess(auth);
+
+    if (fieldName !== UploadFieldName.ASSET_DATA) {
+      return null;
+    }
+
+    const filename = body.filename || file.originalName;
+    return this.databaseRepository.createMediaUpload({
+      ownerId: auth.user.id,
+      kind: 'original',
+      mimeType: mimeTypes.lookup(filename),
+    });
+  }
+
+  async finalizeUpload(path: string, sizeBytes: number, checksum?: Buffer | null): Promise<void> {
+    const objectId = getDbMediaId(path);
+    if (objectId) {
+      await this.databaseRepository.finalizeMediaObject(objectId, { sizeBytes, checksum });
+    }
+  }
+
+  async removeUploadFile(path: string): Promise<void> {
+    const objectId = getDbMediaId(path);
+    if (objectId) {
+      await this.databaseRepository.deleteMediaObject(objectId);
+      return;
+    }
+
+    await this.storageRepository.unlink(path);
+  }
+
   getUploadFilename({ auth, fieldName, file, body }: UploadRequest): string {
     requireUploadAccess(auth);
 
@@ -117,6 +156,11 @@ export class AssetMediaService extends BaseService {
   }
 
   async onUploadError(request: AuthRequest, file: Express.Multer.File) {
+    if (file.path) {
+      await this.jobRepository.queue({ name: JobName.FileDelete, data: { files: [file.path] } });
+      return;
+    }
+
     const uploadFilename = this.getUploadFilename(asUploadRequest(request, file));
     const uploadFolder = this.getUploadFolder(asUploadRequest(request, file));
     const uploadPath = `${uploadFolder}/${uploadFilename}`;
@@ -147,6 +191,7 @@ export class AssetMediaService extends BaseService {
         );
       }
 
+      const originalFileName = dto.filename || file.originalName;
       const asset = await this.assetRepository.create({
         ownerId: auth.user.id,
         libraryId: null,
@@ -159,13 +204,15 @@ export class AssetMediaService extends BaseService {
         fileModifiedAt: dto.fileModifiedAt,
         localDateTime: dto.fileCreatedAt,
 
-        type: mimeTypes.assetType(file.originalPath),
+        type: mimeTypes.assetType(originalFileName),
         isFavorite: dto.isFavorite,
         duration: dto.duration || null,
         visibility: dto.visibility ?? AssetVisibility.Timeline,
         livePhotoVideoId: dto.livePhotoVideoId,
-        originalFileName: dto.filename || file.originalName,
+        originalFileName,
       });
+
+      await this.setUploadAssetId(file.originalPath, asset.id);
 
       if (dto.metadata?.length) {
         await this.assetRepository.upsertMetadata(asset.id, dto.metadata);
@@ -177,9 +224,9 @@ export class AssetMediaService extends BaseService {
           path: sidecarFile.originalPath,
           type: AssetFileType.Sidecar,
         });
-        await this.storageRepository.utimes(sidecarFile.originalPath, new Date(), new Date(dto.fileModifiedAt));
+        await this.touchUploadFile(sidecarFile.originalPath, dto.fileModifiedAt);
       }
-      await this.storageRepository.utimes(file.originalPath, new Date(), new Date(dto.fileModifiedAt));
+      await this.touchUploadFile(file.originalPath, dto.fileModifiedAt);
       await this.assetRepository.upsertExif({
         exif: { assetId: asset.id, fileSizeInByte: file.size },
         lockedPropertiesBehavior: 'override',
@@ -236,9 +283,11 @@ export class AssetMediaService extends BaseService {
 
     const path = editedPath ?? originalPath!;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       path,
-      fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
+      fileName:
+        getFileNameWithoutExtension(originalFileName) +
+        (getFilenameExtension(path) || getFilenameExtension(originalFileName)),
       contentType: mimeTypes.lookup(path),
       cacheControl: CacheControl.PrivateWithCache,
     });
@@ -285,7 +334,7 @@ export class AssetMediaService extends BaseService {
       auth.sharedLink && !auth.sharedLink.showExif ? id : getFileNameWithoutExtension(originalFileName);
     const fileName = `${fileNameBase}_${size}${getFilenameExtension(path)}`;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       fileName,
       path,
       contentType: mimeTypes.lookup(path),
@@ -304,7 +353,7 @@ export class AssetMediaService extends BaseService {
 
     const filepath = asset.encodedVideoPath || asset.originalPath;
 
-    return new ImmichFileResponse({
+    return this.getFileResponse({
       path: filepath,
       contentType: mimeTypes.lookup(filepath),
       cacheControl: CacheControl.PrivateWithCache,
@@ -351,5 +400,40 @@ export class AssetMediaService extends BaseService {
     if (auth.user.quotaSizeInBytes !== null && auth.user.quotaSizeInBytes < auth.user.quotaUsageInBytes + size) {
       throw new BadRequestException('Quota has been exceeded!');
     }
+  }
+
+  private async setUploadAssetId(path: string, assetId: string): Promise<void> {
+    const objectId = getDbMediaId(path);
+    if (objectId) {
+      await this.databaseRepository.setMediaObjectAssetId(objectId, assetId);
+    }
+  }
+
+  private async touchUploadFile(path: string, modifiedAt: Date): Promise<void> {
+    if (getDbMediaId(path)) {
+      return;
+    }
+
+    await this.storageRepository.utimes(path, new Date(), new Date(modifiedAt));
+  }
+
+  private async getFileResponse(response: {
+    path: string;
+    contentType: string;
+    cacheControl: CacheControl;
+    fileName?: string;
+  }): Promise<ImmichFileResponse> {
+    const objectId = getDbMediaId(response.path);
+    if (!objectId) {
+      return new ImmichFileResponse(response);
+    }
+
+    const stream = await this.databaseRepository.createMediaReadStream(objectId);
+    return new ImmichFileResponse({
+      stream,
+      fileName: response.fileName,
+      contentType: stream.type || response.contentType,
+      cacheControl: response.cacheControl,
+    });
   }
 }

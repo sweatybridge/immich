@@ -3,8 +3,10 @@ import { Injectable } from '@nestjs/common';
 import AsyncLock from 'async-lock';
 import { FileMigrationProvider, Kysely, Migrator, sql } from 'kysely';
 import { InjectKysely } from 'nestjs-kysely';
+import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import semver from 'semver';
 import {
   EXTENSION_NAMES,
@@ -19,11 +21,13 @@ import { GenerateSql } from 'src/decorators';
 import { DatabaseExtension, DatabaseLock, VectorIndex } from 'src/enum';
 import { ConfigRepository } from 'src/repositories/config.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { ImmichReadStream } from 'src/repositories/storage.repository';
 import 'src/schema'; // make sure all schema definitions are imported for schemaFromCode
 import { DB } from 'src/schema';
 import { immich_uuid_v7 } from 'src/schema/functions';
 import { ExtensionVersion, VectorExtension } from 'src/types';
 import { vectorIndexQuery } from 'src/utils/database';
+import { asDbMediaPath } from 'src/utils/db-media';
 import z from 'zod';
 
 export let cachedVectorExtension: VectorExtension | undefined;
@@ -51,6 +55,66 @@ export const probes: Record<VectorIndex, number> = {
   [VectorIndex.Clip]: 1,
   [VectorIndex.Face]: 1,
 };
+
+export interface MediaObject {
+  id: string;
+  ownerId: string;
+  assetId: string | null;
+  kind: string;
+  mimeType: string | null;
+  sizeBytes: number;
+}
+
+export interface CreateMediaObjectOptions {
+  ownerId: string;
+  assetId?: string | null;
+  kind: string;
+  mimeType?: string | null;
+  data: Buffer;
+  checksum?: Buffer | null;
+}
+
+export interface CreateMediaUploadOptions {
+  ownerId: string;
+  assetId?: string | null;
+  kind: string;
+  mimeType?: string | null;
+}
+
+export interface FinalizeMediaObjectOptions {
+  sizeBytes: number;
+  checksum?: Buffer | null;
+}
+
+export interface PgFfmpegTranscodeOptions {
+  inputObjectId: string;
+  ownerId: string;
+  assetId: string;
+  outputKind: string;
+  mimeType: string;
+  format: string | null;
+  filter?: string | null;
+  codec?: string | null;
+  preset?: string | null;
+  crf?: number | null;
+  bitrate?: number | null;
+  audioCodec?: string | null;
+  audioFilter?: string | null;
+  audioBitrate?: number | null;
+  hwaccel?: boolean;
+}
+
+export interface PgFfmpegThumbnailOptions {
+  inputObjectId: string;
+  ownerId: string;
+  assetId: string;
+  outputKind: string;
+  mimeType: string;
+  format: string;
+  seconds?: number;
+}
+
+const MEDIA_OBJECT_CHUNK_SIZE = 1024 * 1024;
 
 @Injectable()
 export class DatabaseRepository {
@@ -104,6 +168,197 @@ export class DatabaseRepository {
 
   getPostgresVersionRange(): string {
     return POSTGRES_VERSION_RANGE;
+  }
+
+  async getMediaObject(id: string): Promise<MediaObject | undefined> {
+    return this.db
+      .selectFrom('media_object')
+      .select(['id', 'ownerId', 'assetId', 'kind', 'mimeType', 'sizeBytes'])
+      .where('id', '=', id)
+      .executeTakeFirst();
+  }
+
+  async createMediaObject({
+    ownerId,
+    assetId = null,
+    kind,
+    mimeType = null,
+    data,
+    checksum = null,
+  }: CreateMediaObjectOptions) {
+    const id = randomUUID();
+
+    await this.db.transaction().execute(async (tx) => {
+      await tx
+        .insertInto('media_object')
+        .values({ id, ownerId, assetId, kind, mimeType, sizeBytes: data.length, checksum })
+        .execute();
+
+      const chunks = [];
+      for (let offset = 0, chunkIndex = 0; offset < data.length; offset += MEDIA_OBJECT_CHUNK_SIZE, chunkIndex++) {
+        chunks.push({
+          objectId: id,
+          chunkIndex,
+          data: data.subarray(offset, offset + MEDIA_OBJECT_CHUNK_SIZE),
+        });
+      }
+
+      if (chunks.length > 0) {
+        await tx.insertInto('media_object_chunk').values(chunks).execute();
+      }
+    });
+
+    return asDbMediaPath(id);
+  }
+
+  async createMediaUpload({
+    ownerId,
+    assetId = null,
+    kind,
+    mimeType = null,
+  }: CreateMediaUploadOptions): Promise<{ id: string; path: string; stream: Writable }> {
+    const id = randomUUID();
+    let chunkIndex = 0;
+
+    await this.db
+      .insertInto('media_object')
+      .values({ id, ownerId, assetId, kind, mimeType, sizeBytes: 0, checksum: null })
+      .execute();
+
+    const stream = new Writable({
+      write: (chunk: Buffer, _encoding, callback) => {
+        const data = Buffer.from(chunk);
+        this.db
+          .insertInto('media_object_chunk')
+          .values({ objectId: id, chunkIndex: chunkIndex++, data })
+          .execute()
+          .then(() => callback())
+          .catch(callback);
+      },
+    });
+
+    return { id, path: asDbMediaPath(id), stream };
+  }
+
+  async finalizeMediaObject(id: string, { sizeBytes, checksum = null }: FinalizeMediaObjectOptions): Promise<void> {
+    await this.db
+      .updateTable('media_object')
+      .set({ sizeBytes, checksum, updatedAt: new Date() })
+      .where('id', '=', id)
+      .execute();
+  }
+
+  async setMediaObjectAssetId(id: string, assetId: string): Promise<void> {
+    await this.db.updateTable('media_object').set({ assetId, updatedAt: new Date() }).where('id', '=', id).execute();
+  }
+
+  async readMediaObject(id: string): Promise<Buffer> {
+    const chunks = await this.db
+      .selectFrom('media_object_chunk')
+      .select('data')
+      .where('objectId', '=', id)
+      .orderBy('chunkIndex', 'asc')
+      .execute();
+
+    return Buffer.concat(chunks.map(({ data }) => data));
+  }
+
+  async createMediaReadStream(id: string): Promise<ImmichReadStream> {
+    const object = await this.getMediaObject(id);
+    if (!object) {
+      throw new Error(`Media object not found: ${id}`);
+    }
+
+    const chunks = await this.db
+      .selectFrom('media_object_chunk')
+      .select('data')
+      .where('objectId', '=', id)
+      .orderBy('chunkIndex', 'asc')
+      .execute();
+
+    return {
+      stream: Readable.from(chunks.map(({ data }) => data)),
+      length: object.sizeBytes,
+      type: object.mimeType || undefined,
+    };
+  }
+
+  async deleteMediaObject(id: string): Promise<void> {
+    await this.db.deleteFrom('media_object').where('id', '=', id).execute();
+  }
+
+  async transcodeMediaObject(options: PgFfmpegTranscodeOptions): Promise<string> {
+    const outputId = randomUUID();
+
+    await sql`
+      WITH input AS (
+        SELECT string_agg("data", ''::bytea ORDER BY "chunkIndex") AS data
+        FROM "media_object_chunk"
+        WHERE "objectId" = ${options.inputObjectId}
+      ),
+      output AS (
+        SELECT ffmpeg.transcode(
+          data,
+          format => ${options.format},
+          filter => ${options.filter ?? null},
+          codec => ${options.codec ?? null},
+          preset => ${options.preset ?? null},
+          crf => ${options.crf ?? null},
+          bitrate => ${options.bitrate ?? null},
+          audio_codec => ${options.audioCodec ?? null},
+          audio_filter => ${options.audioFilter ?? null},
+          audio_bitrate => ${options.audioBitrate ?? null},
+          hwaccel => ${options.hwaccel ?? false}
+        ) AS data
+        FROM input
+      ),
+      object_insert AS (
+        INSERT INTO "media_object" ("id", "ownerId", "assetId", "kind", "mimeType", "sizeBytes")
+        SELECT
+          ${outputId},
+          ${options.ownerId},
+          ${options.assetId},
+          ${options.outputKind},
+          ${options.mimeType},
+          octet_length(data)
+        FROM output
+      )
+      INSERT INTO "media_object_chunk" ("objectId", "chunkIndex", "data")
+      SELECT ${outputId}, 0, data FROM output
+    `.execute(this.db);
+
+    return asDbMediaPath(outputId);
+  }
+
+  async thumbnailMediaObject(options: PgFfmpegThumbnailOptions): Promise<string> {
+    const outputId = randomUUID();
+
+    await sql`
+      WITH input AS (
+        SELECT string_agg("data", ''::bytea ORDER BY "chunkIndex") AS data
+        FROM "media_object_chunk"
+        WHERE "objectId" = ${options.inputObjectId}
+      ),
+      output AS (
+        SELECT ffmpeg.thumbnail(data, seconds => ${options.seconds ?? 0}, format => ${options.format}) AS data
+        FROM input
+      ),
+      object_insert AS (
+        INSERT INTO "media_object" ("id", "ownerId", "assetId", "kind", "mimeType", "sizeBytes")
+        SELECT
+          ${outputId},
+          ${options.ownerId},
+          ${options.assetId},
+          ${options.outputKind},
+          ${options.mimeType},
+          octet_length(data)
+        FROM output
+      )
+      INSERT INTO "media_object_chunk" ("objectId", "chunkIndex", "data")
+      SELECT ${outputId}, 0, data FROM output
+    `.execute(this.db);
+
+    return asDbMediaPath(outputId);
   }
 
   async createExtension(extension: DatabaseExtension): Promise<void> {
